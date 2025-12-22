@@ -1,0 +1,68 @@
+   Compiling proc-macro2 v1.0.103
+   Compiling quote v1.0.42
+   Compiling unicode-ident v1.0.22
+   Compiling serde_core v1.0.228
+   Compiling serde v1.0.228
+    Checking cfg-if v1.0.4
+   Compiling windows_x86_64_msvc v0.53.1
+    Checking windows-link v0.2.1
+   Compiling parking_lot_core v0.9.12
+    Checking pin-project-lite v0.2.16
+   Compiling typenum v1.19.0
+   Compiling version_check v0.9.5
+   Compiling zerocopy v0.8.31
+    Checking futures-core v0.3.31
+    Checking memchr v2.7.6
+    Checking once_cell v1.21.3
+    Checking windows-sys v0.61.2
+   Compiling icu_normalizer_data v2.1.1
+   Compiling icu_properties_data v2.1.2
+    Checking scopeguard v1.2.0
+    Checking stable_deref_trait v1.2.1
+    Checking lock_api v0.4.14
+    Checking itoa v1.0.16
+   Compiling autocfg v1.5.0
+   Compiling generic-array v0.14.7
+    Checking tracing-core v0.1.36
+    Checking log v0.4.29
+   Compiling crossbeam-utils v0.8.21
+    Checking futures-sink v0.3.31
+    Checking pin-utils v0.1.0
+   Compiling num-traits v0.2.19
+   Compiling getrandom v0.2.16
+   Compiling windows_x86_64_msvc v0.48.5
+    Checking slab v0.4.11
+    Checking futures-io v0.3.31
+    Checking windows-targets v0.53.5
+    Checking futures-channel v0.3.31
+    Checking futures-task v0.3.31
+error: failed to run custom build command for `proc-macro2 v1.0.103`
+
+Caused by:
+  process didn't exit successfully: `C:\Users\risha\Desktop\Work\relation-graph\target\debug\build\proc-macro2-dd0eda0b781f1ba1\build-script-build` (exit code: 1)
+  --- stdout
+  cargo:rustc-check-cfg=cfg(fuzzing)
+  cargo:rustc-check-cfg=cfg(no_is_available)
+  cargo:rustc-check-cfg=cfg(no_literal_byte_character)
+  cargo:rustc-check-cfg=cfg(no_literal_c_string)
+  cargo:rustc-check-cfg=cfg(no_source_text)
+  cargo:rustc-check-cfg=cfg(proc_macro_span)
+  cargo:rustc-check-cfg=cfg(proc_macro_span_file)
+  cargo:rustc-check-cfg=cfg(proc_macro_span_location)
+  cargo:rustc-check-cfg=cfg(procmacro2_backtrace)
+  cargo:rustc-check-cfg=cfg(procmacro2_build_probe)
+  cargo:rustc-check-cfg=cfg(procmacro2_nightly_testing)
+  cargo:rustc-check-cfg=cfg(procmacro2_semver_exempt)
+  cargo:rustc-check-cfg=cfg(randomize_layout)
+  cargo:rustc-check-cfg=cfg(span_locations)
+  cargo:rustc-check-cfg=cfg(super_unstable)
+  cargo:rustc-check-cfg=cfg(wrap_proc_macro)
+  cargo:rerun-if-changed=src/probe/proc_macro_span.rs
+  cargo:rustc-cfg=wrap_proc_macro
+  cargo:rerun-if-changed=src/probe/proc_macro_span_location.rs
+  cargo:rustc-cfg=proc_macro_span_location
+  cargo:rerun-if-changed=src/probe/proc_macro_span_file.rs
+
+  --- stderr
+  Failed to clean up C:\Users\risha\Desktop\Work\relation-graph\target\debug\build\proc-macro2-92d254740bb9c5ea\out\probe: The process cannot access the file because it is being used by another process. (os error 32)
+warning: build failed, waiting for other jobs to finish...
