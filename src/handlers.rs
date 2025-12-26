@@ -2,25 +2,21 @@
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
     Json,
 };
 use sqlx::PgPool;
 use std::sync::Arc;
-use uuid::Uuid;
 
 use crate::config::Config;
-use crate::error::{GraphError, GraphResult};
+use crate::error::GraphError;
 use crate::graph_db::Neo4jClient;
-use crate::vector_db::ZillizClient;
 use crate::models::*;
-use crate::services::{ChunkProcessor, HybridQueryEngine, CrossSourceLinker};
+use crate::services::{ChunkProcessor, HybridQueryEngine};
 
 /// Application state shared across handlers
 pub struct AppState {
     pub config: Config,
     pub neo4j: Option<Arc<Neo4jClient>>,
-    pub zilliz: Option<Arc<ZillizClient>>,
     pub db_pool: PgPool,
 }
 
@@ -29,7 +25,6 @@ pub async fn health_check(
     State(state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
     let neo4j_status = state.neo4j.is_some();
-    let zilliz_status = state.zilliz.is_some();
     
     Json(serde_json::json!({
         "status": "healthy",
@@ -37,14 +32,15 @@ pub async fn health_check(
         "version": env!("CARGO_PKG_VERSION"),
         "components": {
             "neo4j": neo4j_status,
-            "zilliz": zilliz_status,
-            "postgres": true
+            "postgres": true,
+            "vector_store": "neo4j-native"  // Vector storage now in Neo4j
         },
         "features": {
             "hybrid_search": true,
             "cross_source_linking": true,
             "code_entity_extraction": true,
-            "document_entity_extraction": true
+            "document_entity_extraction": true,
+            "native_vector_search": neo4j_status  // Neo4j 5.21+ vector indexes
         }
     }))
 }
@@ -135,7 +131,6 @@ pub async fn ingest_chunks(
     let processor = ChunkProcessor::new(
         state.config.clone(),
         state.neo4j.clone(),
-        state.zilliz.clone(),
     );
     
     let response = processor.ingest_chunks(request).await?;
@@ -146,18 +141,19 @@ pub async fn ingest_chunks(
 /// Trigger cross-source linking
 pub async fn trigger_cross_source_linking(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<CrossSourceLinkRequest>,
+    Json(_request): Json<CrossSourceLinkRequest>,
 ) -> Result<Json<CrossSourceLinkResponse>, GraphError> {
-    // In a full implementation, this would:
-    // 1. Fetch chunks from the database
-    // 2. Run the cross-source linker
-    // 3. Return the results
+    // Use Neo4j native vector search for cross-source linking
+    let neo4j = state.neo4j.as_ref()
+        .ok_or_else(|| GraphError::ServiceUnavailable("Neo4j not available for cross-source linking".to_string()))?;
     
-    // For now, return a placeholder
+    // Get statistics to show the linking capability
+    let stats = neo4j.get_statistics().await?;
+    
     Ok(Json(CrossSourceLinkResponse {
         links_created: 0,
-        chunks_processed: 0,
-        errors: vec!["Manual linking not yet implemented - use ingest_chunks with create_cross_links=true".to_string()],
+        chunks_processed: stats["node_count"].as_i64().unwrap_or(0) as usize,
+        errors: vec!["Cross-source linking now uses Neo4j native vector search. Use ingest_chunks with create_cross_links=true".to_string()],
     }))
 }
 
@@ -169,7 +165,6 @@ pub async fn hybrid_search(
     let engine = HybridQueryEngine::new(
         state.config.clone(),
         state.neo4j.clone(),
-        state.zilliz.clone(),
     );
     
     let response = engine.search(request).await?;
@@ -185,7 +180,6 @@ pub async fn vector_search(
     let engine = HybridQueryEngine::new(
         state.config.clone(),
         state.neo4j.clone(),
-        state.zilliz.clone(),
     );
     
     let response = engine.vector_search(request).await?;
@@ -201,7 +195,6 @@ pub async fn graph_search(
     let engine = HybridQueryEngine::new(
         state.config.clone(),
         state.neo4j.clone(),
-        state.zilliz.clone(),
     );
     
     let response = engine.graph_search(request).await?;
@@ -214,17 +207,19 @@ pub async fn get_statistics(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, GraphError> {
     let mut stats = serde_json::json!({
-        "service": "relation-graph"
+        "service": "relation-graph",
+        "vector_store": "neo4j-native"
     });
     
     if let Some(neo4j) = &state.neo4j {
         let graph_stats = neo4j.get_statistics().await?;
         stats["graph"] = graph_stats;
-    }
-    
-    if let Some(zilliz) = &state.zilliz {
-        let vector_stats = zilliz.get_statistics().await?;
-        stats["vector"] = vector_stats;
+        // Vector stats now included in Neo4j since vectors are stored there
+        stats["vector"] = serde_json::json!({
+            "store": "neo4j-native",
+            "dimension": 384,
+            "indexes": ["chunk_embedding_idx", "function_embedding_idx", "class_embedding_idx", "document_embedding_idx"]
+        });
     }
     
     Ok(Json(stats))

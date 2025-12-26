@@ -8,19 +8,16 @@ pub struct Config {
     pub port: u16,
     pub host: String,
     
-    // Neo4j
+    // Neo4j (handles both graph AND vector storage)
     pub neo4j_uri: String,
     pub neo4j_user: String,
     pub neo4j_password: String,
     pub neo4j_database: String,
     
-    // Zilliz
-    pub zilliz_endpoint: String,
-    pub zilliz_api_key: String,
-    pub zilliz_collection: String,
+    // Vector configuration (stored in Neo4j)
     pub vector_dimension: usize,
     
-    // PostgreSQL
+    // PostgreSQL (evidence tracking, job queue)
     pub database_url: String,
     
     // Service URLs
@@ -35,6 +32,11 @@ pub struct Config {
     pub enable_explicit_mentions: bool,
     pub enable_author_overlap: bool,
     pub temporal_proximity_days: i64,
+    
+    // Confidence boosters
+    pub explicit_mention_boost: f32,
+    pub temporal_proximity_boost: f32,
+    pub author_overlap_boost: f32,
     
     // Graph traversal
     pub max_graph_hops: usize,
@@ -62,16 +64,12 @@ impl Config {
             neo4j_database: env::var("NEO4J_DATABASE")
                 .unwrap_or_else(|_| "neo4j".to_string()),
             
-            zilliz_endpoint: env::var("ZILLIZ_ENDPOINT")
-                .unwrap_or_else(|_| "http://localhost:19530".to_string()),
-            zilliz_api_key: env::var("ZILLIZ_API_KEY")
-                .unwrap_or_default(),
-            zilliz_collection: env::var("ZILLIZ_COLLECTION")
-                .unwrap_or_else(|_| "knowledge_vectors".to_string()),
+            // Vector dimension for Neo4j native vector storage
+            // 384-dim recommended for sentence-transformers
             vector_dimension: env::var("VECTOR_DIMENSION")
-                .unwrap_or_else(|_| "1024".to_string())
+                .unwrap_or_else(|_| "384".to_string())
                 .parse()
-                .unwrap_or(1024),
+                .unwrap_or(384),
             
             database_url: env::var("DATABASE_URL")
                 .expect("DATABASE_URL must be set"),
@@ -84,9 +82,9 @@ impl Config {
                 .unwrap_or_else(|_| "http://localhost:3013".to_string()),
             
             similarity_threshold: env::var("SIMILARITY_THRESHOLD")
-                .unwrap_or_else(|_| "0.75".to_string())
+                .unwrap_or_else(|_| "0.5".to_string())
                 .parse()
-                .unwrap_or(0.75),
+                .unwrap_or(0.5),
             max_cross_links_per_chunk: env::var("MAX_CROSS_LINKS_PER_CHUNK")
                 .unwrap_or_else(|_| "5".to_string())
                 .parse()
@@ -107,6 +105,20 @@ impl Config {
                 .unwrap_or_else(|_| "7".to_string())
                 .parse()
                 .unwrap_or(7),
+            
+            // Confidence boosters (configurable weights)
+            explicit_mention_boost: env::var("EXPLICIT_MENTION_BOOST")
+                .unwrap_or_else(|_| "0.15".to_string())
+                .parse()
+                .unwrap_or(0.15),
+            temporal_proximity_boost: env::var("TEMPORAL_PROXIMITY_BOOST")
+                .unwrap_or_else(|_| "0.10".to_string())
+                .parse()
+                .unwrap_or(0.10),
+            author_overlap_boost: env::var("AUTHOR_OVERLAP_BOOST")
+                .unwrap_or_else(|_| "0.10".to_string())
+                .parse()
+                .unwrap_or(0.10),
             
             max_graph_hops: env::var("MAX_GRAPH_HOPS")
                 .unwrap_or_else(|_| "2".to_string())

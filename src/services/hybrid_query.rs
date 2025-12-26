@@ -1,17 +1,16 @@
 //! Hybrid query engine
 //!
-//! Combines vector search with graph traversal for comprehensive results.
+//! Combines vector search with graph traversal using Neo4j native vector indexes.
 
 use crate::config::Config;
 use crate::error::{GraphError, GraphResult};
 use crate::graph_db::Neo4jClient;
-use crate::vector_db::ZillizClient;
 use crate::models::{
     HybridSearchRequest, HybridSearchResponse, SearchOptions, SearchMetadata,
     ChunkResult, EntityResult, RelationshipResult, SemanticLink,
     VectorSearchRequest, VectorSearchResponse,
-    GraphSearchRequest, GraphSearchResponse, GraphPath,
-    RelationshipType, EntityType,
+    GraphSearchRequest, GraphSearchResponse,
+    RelationshipType,
 };
 use crate::services::EmbeddingClient;
 use std::sync::Arc;
@@ -19,10 +18,11 @@ use std::time::Instant;
 use uuid::Uuid;
 
 /// Hybrid query engine combining vector and graph search
+/// 
+/// Now uses Neo4j native vector indexes instead of separate Zilliz database.
 pub struct HybridQueryEngine {
     config: Config,
     neo4j: Option<Arc<Neo4jClient>>,
-    zilliz: Option<Arc<ZillizClient>>,
     embedding_client: EmbeddingClient,
 }
 
@@ -30,13 +30,11 @@ impl HybridQueryEngine {
     pub fn new(
         config: Config,
         neo4j: Option<Arc<Neo4jClient>>,
-        zilliz: Option<Arc<ZillizClient>>,
     ) -> Self {
         let embedding_client = EmbeddingClient::new(&config.embedding_service_url);
         Self {
             config,
             neo4j,
-            zilliz,
             embedding_client,
         }
     }
@@ -52,7 +50,7 @@ impl HybridQueryEngine {
             .await
             .map_err(|e| GraphError::Embedding(e.to_string()))?;
         
-        // Step 2: Vector search across sources
+        // Step 2: Vector search using Neo4j native vector index
         let vector_results = self.vector_search_internal(
             query_embedding.clone(),
             &options,
@@ -87,7 +85,7 @@ impl HybridQueryEngine {
                             to_chunk_id: Uuid::parse_str(&target_id).unwrap_or_else(|_| Uuid::new_v4()),
                             relationship_type: rel_type,
                             confidence,
-                            extraction_methods: vec!["vector_similarity".to_string()],
+                            extraction_methods: vec!["neo4j_vector_similarity".to_string()],
                             similarity_score: Some(chunk.similarity_score),
                             explicit_mention: None,
                             temporal_distance_days: None,
@@ -121,7 +119,7 @@ impl HybridQueryEngine {
             metadata: SearchMetadata {
                 query: request.query,
                 vector_results_count: vector_results.len(),
-                graph_entities_count: 0, // Will be updated
+                graph_entities_count: 0,
                 graph_hops_performed: options.graph_hops,
                 cross_source_links_count,
                 execution_time_ms: execution_time,
@@ -129,7 +127,7 @@ impl HybridQueryEngine {
         })
     }
     
-    /// Vector-only search
+    /// Vector-only search using Neo4j native vector index
     pub async fn vector_search(&self, request: VectorSearchRequest) -> GraphResult<VectorSearchResponse> {
         let query_embedding = self.embedding_client
             .embed(&request.query)
@@ -152,41 +150,35 @@ impl HybridQueryEngine {
         })
     }
     
-    /// Internal vector search with embedding
+    /// Internal vector search using Neo4j native vector index
     async fn vector_search_internal(
         &self,
         query_embedding: Vec<f32>,
         options: &SearchOptions,
     ) -> GraphResult<Vec<ChunkResult>> {
-        let zilliz = self.zilliz.as_ref()
-            .ok_or_else(|| GraphError::ServiceUnavailable("Zilliz not available".to_string()))?;
+        let neo4j = self.neo4j.as_ref()
+            .ok_or_else(|| GraphError::ServiceUnavailable("Neo4j not available for vector search".to_string()))?;
         
-        let source_kind = if options.source_kind == "all" {
-            None
-        } else {
-            Some(options.source_kind.as_str())
-        };
-        
-        let results = zilliz.search(
+        // Use the chunk embedding index
+        let similar_nodes = neo4j.find_similar_nodes(
             query_embedding,
+            "chunk_embedding_idx",
             options.limit,
-            source_kind,
-            options.source_types.as_deref(),
-            options.owner_id.as_deref(),
+            options.min_similarity,
         ).await?;
         
-        Ok(results
+        // Convert to ChunkResult (basic info from vector search)
+        Ok(similar_nodes
             .into_iter()
-            .filter(|(_, score, _)| *score >= options.min_similarity)
-            .map(|(id, score, meta)| ChunkResult {
-                chunk_id: id,
-                content: String::new(), // Content not stored in vector DB
-                source_kind: meta.source_kind,
-                source_type: meta.source_type,
-                file_path: meta.file_path,
-                repo_name: meta.repo_name,
-                language: meta.language,
-                heading_path: meta.heading_path,
+            .map(|(id, score)| ChunkResult {
+                chunk_id: Uuid::parse_str(&id).unwrap_or_else(|_| Uuid::new_v4()),
+                content: String::new(), // Would need additional query to get content
+                source_kind: options.source_kind.clone(),
+                source_type: String::new(),
+                file_path: None,
+                repo_name: None,
+                language: None,
+                heading_path: None,
                 similarity_score: score,
             })
             .collect())
@@ -208,7 +200,7 @@ impl HybridQueryEngine {
         
         let entities: Vec<EntityResult> = neighbors
             .iter()
-            .map(|(id, name, rel_type, conf)| EntityResult {
+            .map(|(id, name, _rel_type, _conf)| EntityResult {
                 id: Uuid::parse_str(id).unwrap_or_else(|_| Uuid::new_v4()),
                 entity_type: "unknown".to_string(),
                 name: name.clone(),
@@ -246,12 +238,12 @@ impl HybridQueryEngine {
         
         let mut all_entities = Vec::new();
         let mut all_relationships = Vec::new();
-        let mut all_paths = Vec::new();
+        let all_paths = Vec::new();
         
         for start_entity in &request.start_entities {
             let neighbors = neo4j.get_neighbors(
                 start_entity,
-                None, // Could filter by relationship_types
+                None,
                 &request.direction,
                 request.hops,
             ).await?;

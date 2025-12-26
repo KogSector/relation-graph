@@ -355,4 +355,319 @@ impl Neo4jClient {
             }))
         }
     }
+    
+    // =========================================================================
+    // VECTOR EMBEDDING METHODS (Neo4j 5.21+)
+    // =========================================================================
+    
+    /// Create a vector index for similarity search
+    /// 
+    /// Note: Neo4j 5.21+ supports native vector indexes
+    pub async fn create_vector_index(
+        &self,
+        index_name: &str,
+        label: &str,
+        property: &str,
+        dimension: usize,
+    ) -> GraphResult<()> {
+        let cypher = format!(
+            r#"
+            CREATE VECTOR INDEX {} IF NOT EXISTS
+            FOR (n:{})
+            ON (n.{})
+            OPTIONS {{
+                indexConfig: {{
+                    `vector.dimensions`: {},
+                    `vector.similarity_function`: 'cosine'
+                }}
+            }}
+            "#,
+            index_name, label, property, dimension
+        );
+        
+        self.graph.execute(query(&cypher))
+            .await
+            .map_err(|e| GraphError::Neo4j(format!("Failed to create vector index: {}", e)))?;
+        
+        tracing::info!("✅ Created vector index '{}' on {}({})", index_name, label, property);
+        Ok(())
+    }
+    
+    /// Set embedding on an existing node
+    pub async fn set_node_embedding(
+        &self,
+        node_id: &str,
+        embedding: Vec<f32>,
+        model: &str,
+        provider: &str,
+    ) -> GraphResult<()> {
+        let cypher = r#"
+            MATCH (n {id: $node_id})
+            SET n.embedding = $embedding,
+                n.embedding_model = $model,
+                n.embedding_provider = $provider,
+                n.embedding_timestamp = datetime()
+            RETURN n.id
+        "#;
+        
+        // Convert Vec<f32> to Vec<f64> for Neo4j
+        let embedding_f64: Vec<f64> = embedding.iter().map(|&x| x as f64).collect();
+        
+        self.graph.execute(
+            query(cypher)
+                .param("node_id", node_id)
+                .param("embedding", embedding_f64)
+                .param("model", model)
+                .param("provider", provider)
+        )
+        .await
+        .map_err(|e| GraphError::Neo4j(format!("Failed to set embedding: {}", e)))?;
+        
+        Ok(())
+    }
+    
+    /// Batch set embeddings on multiple nodes
+    pub async fn batch_set_embeddings(
+        &self,
+        updates: Vec<(String, Vec<f32>, String, String)>, // (node_id, embedding, model, provider)
+    ) -> GraphResult<usize> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        
+        let cypher = r#"
+            UNWIND $updates AS update
+            MATCH (n {id: update.node_id})
+            SET n.embedding = update.embedding,
+                n.embedding_model = update.model,
+                n.embedding_provider = update.provider,
+                n.embedding_timestamp = datetime()
+            RETURN count(n) as updated_count
+        "#;
+        
+        // Convert to parameter format
+        let updates_param: Vec<serde_json::Value> = updates.iter().map(|(id, emb, model, provider)| {
+            let emb_f64: Vec<f64> = emb.iter().map(|&x| x as f64).collect();
+            serde_json::json!({
+                "node_id": id,
+                "embedding": emb_f64,
+                "model": model,
+                "provider": provider
+            })
+        }).collect();
+        
+        let mut result = self.graph.execute(
+            query(cypher).param("updates", serde_json::to_string(&updates_param).unwrap_or_default())
+        )
+        .await
+        .map_err(|e| GraphError::Neo4j(format!("Failed to batch set embeddings: {}", e)))?;
+        
+        if let Some(row) = result.next().await.map_err(|e| GraphError::Neo4j(e.to_string()))? {
+            let count: i64 = row.get("updated_count").unwrap_or(0);
+            Ok(count as usize)
+        } else {
+            Ok(0)
+        }
+    }
+    
+    /// Find similar nodes using vector index
+    /// 
+    /// Returns Vec<(node_id, similarity_score)>
+    pub async fn find_similar_nodes(
+        &self,
+        embedding: Vec<f32>,
+        index_name: &str,
+        limit: usize,
+        min_score: f32,
+    ) -> GraphResult<Vec<(String, f32)>> {
+        let cypher = format!(
+            r#"
+            CALL db.index.vector.queryNodes('{}', $limit, $embedding)
+            YIELD node, score
+            WHERE score >= $min_score
+            RETURN node.id as node_id, score
+            "#,
+            index_name
+        );
+        
+        let embedding_f64: Vec<f64> = embedding.iter().map(|&x| x as f64).collect();
+        
+        let mut result = self.graph.execute(
+            query(&cypher)
+                .param("embedding", embedding_f64)
+                .param("limit", limit as i64)
+                .param("min_score", min_score as f64)
+        )
+        .await
+        .map_err(|e| GraphError::Neo4j(format!("Vector search failed: {}", e)))?;
+        
+        let mut similar = Vec::new();
+        while let Some(row) = result.next().await.map_err(|e| GraphError::Neo4j(e.to_string()))? {
+            if let (Ok(id), Ok(score)) = (
+                row.get::<String>("node_id"),
+                row.get::<f64>("score"),
+            ) {
+                similar.push((id, score as f32));
+            }
+        }
+        
+        Ok(similar)
+    }
+    
+    /// Find similar chunks for cross-source linking
+    /// 
+    /// Combines vector similarity with confidence boosters in a single query
+    pub async fn find_similar_chunks_for_linking(
+        &self,
+        source_chunk_id: &str,
+        target_source_kind: &str,
+        limit: usize,
+        min_similarity: f32,
+    ) -> GraphResult<Vec<CrossSourceMatch>> {
+        let cypher = r#"
+            // Get source chunk and its embedding
+            MATCH (source:CHUNK {id: $source_id})
+            WHERE source.embedding IS NOT NULL
+            
+            // Vector similarity search
+            CALL db.index.vector.queryNodes('chunk_embedding_idx', $limit * 2, source.embedding)
+            YIELD node AS target, score
+            
+            // Filter by target source kind and minimum similarity
+            WHERE target.source_kind = $target_kind
+              AND target.id <> $source_id
+              AND score >= $min_similarity
+            
+            // Calculate confidence boosters
+            WITH source, target, score,
+                 // Explicit mention boost: +15% if document mentions entity name
+                 CASE 
+                     WHEN source.entity_names IS NOT NULL 
+                          AND any(name IN source.entity_names WHERE target.content CONTAINS name)
+                     THEN 0.15 
+                     ELSE 0 
+                 END AS mention_boost,
+                 // Author overlap boost: +10% if authors match
+                 CASE 
+                     WHEN source.author IS NOT NULL 
+                          AND target.author IS NOT NULL 
+                          AND source.author = target.author 
+                     THEN 0.10 
+                     ELSE 0 
+                 END AS author_boost
+            
+            // Calculate final confidence
+            WITH source, target, score, mention_boost, author_boost,
+                 (score + mention_boost + author_boost) AS confidence
+            
+            RETURN 
+                target.id AS target_id,
+                target.content AS target_content,
+                target.source_type AS target_source_type,
+                target.file_path AS target_file_path,
+                score AS similarity_score,
+                confidence,
+                mention_boost > 0 AS has_explicit_mention,
+                author_boost > 0 AS has_author_overlap
+            ORDER BY confidence DESC
+            LIMIT $limit
+        "#;
+        
+        let mut result = self.graph.execute(
+            query(cypher)
+                .param("source_id", source_chunk_id)
+                .param("target_kind", target_source_kind)
+                .param("limit", limit as i64)
+                .param("min_similarity", min_similarity as f64)
+        )
+        .await
+        .map_err(|e| GraphError::Neo4j(format!("Cross-source search failed: {}", e)))?;
+        
+        let mut matches = Vec::new();
+        while let Some(row) = result.next().await.map_err(|e| GraphError::Neo4j(e.to_string()))? {
+            matches.push(CrossSourceMatch {
+                target_id: row.get("target_id").unwrap_or_default(),
+                target_content: row.get("target_content").ok(),
+                target_source_type: row.get("target_source_type").ok(),
+                target_file_path: row.get("target_file_path").ok(),
+                similarity_score: row.get::<f64>("similarity_score").unwrap_or(0.0) as f32,
+                confidence: row.get::<f64>("confidence").unwrap_or(0.0) as f32,
+                has_explicit_mention: row.get("has_explicit_mention").unwrap_or(false),
+                has_author_overlap: row.get("has_author_overlap").unwrap_or(false),
+            });
+        }
+        
+        Ok(matches)
+    }
+    
+    /// Create cross-source relationship with evidence
+    pub async fn create_cross_source_link(
+        &self,
+        from_id: &str,
+        to_id: &str,
+        confidence: f32,
+        similarity_score: f32,
+        has_explicit_mention: bool,
+        has_author_overlap: bool,
+    ) -> GraphResult<String> {
+        let cypher = r#"
+            MATCH (a {id: $from_id}), (b {id: $to_id})
+            MERGE (a)-[r:SEMANTICALLY_SIMILAR]->(b)
+            SET r.confidence = $confidence,
+                r.similarity_score = $similarity_score,
+                r.explicit_mention = $explicit_mention,
+                r.author_overlap = $author_overlap,
+                r.created_at = datetime(),
+                r.updated_at = datetime()
+            RETURN elementId(r) as rel_id
+        "#;
+        
+        let mut result = self.graph.execute(
+            query(cypher)
+                .param("from_id", from_id)
+                .param("to_id", to_id)
+                .param("confidence", confidence as f64)
+                .param("similarity_score", similarity_score as f64)
+                .param("explicit_mention", has_explicit_mention)
+                .param("author_overlap", has_author_overlap)
+        )
+        .await
+        .map_err(|e| GraphError::Neo4j(e.to_string()))?;
+        
+        if let Some(row) = result.next().await.map_err(|e| GraphError::Neo4j(e.to_string()))? {
+            let rel_id: String = row.get("rel_id").map_err(|e| GraphError::Neo4j(e.to_string()))?;
+            Ok(rel_id)
+        } else {
+            Err(GraphError::Neo4j("Failed to create cross-source link".to_string()))
+        }
+    }
+    
+    /// Initialize vector indexes for the knowledge graph
+    pub async fn initialize_vector_indexes(&self, dimension: usize) -> GraphResult<()> {
+        // Create index for chunks
+        self.create_vector_index("chunk_embedding_idx", "CHUNK", "embedding", dimension).await?;
+        
+        // Create indexes for main entity types
+        for label in &["FUNCTION", "CLASS", "DOCUMENT", "SECTION", "CONCEPT", "FILE", "MODULE"] {
+            let index_name = format!("{}_embedding_idx", label.to_lowercase());
+            self.create_vector_index(&index_name, label, "embedding", dimension).await?;
+        }
+        
+        tracing::info!("✅ All vector indexes initialized");
+        Ok(())
+    }
 }
+
+/// Result of a cross-source similarity search
+#[derive(Debug, Clone)]
+pub struct CrossSourceMatch {
+    pub target_id: String,
+    pub target_content: Option<String>,
+    pub target_source_type: Option<String>,
+    pub target_file_path: Option<String>,
+    pub similarity_score: f32,
+    pub confidence: f32,
+    pub has_explicit_mention: bool,
+    pub has_author_overlap: bool,
+}
+

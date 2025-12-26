@@ -1,7 +1,7 @@
 //! Relation Graph Service - Main Entry Point
 //!
 //! A unified knowledge graph service combining Neo4j graph relationships
-//! with vector embeddings for hybrid code and documentation search.
+//! with native vector embeddings for hybrid code and documentation search.
 
 use axum::{
     routing::{get, post},
@@ -18,14 +18,12 @@ mod config;
 mod error;
 mod models;
 mod graph_db;
-mod vector_db;
 mod extractors;
 mod services;
 mod handlers;
 
 use config::Config;
 use graph_db::Neo4jClient;
-use vector_db::ZillizClient;
 use handlers::AppState;
 
 #[tokio::main]
@@ -45,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
     info!("🔷 Starting Relation Graph Service v{}", env!("CARGO_PKG_VERSION"));
     info!("Port: {}", config.port);
 
-    // Initialize Neo4j client
+    // Initialize Neo4j client (now handles both graph AND vector operations)
     let neo4j_client = match Neo4jClient::new(
         &config.neo4j_uri,
         &config.neo4j_user,
@@ -53,26 +51,18 @@ async fn main() -> anyhow::Result<()> {
     ).await {
         Ok(client) => {
             info!("✅ Neo4j connection established");
+            
+            // Initialize vector indexes on startup
+            if let Err(e) = client.initialize_vector_indexes(384).await {
+                tracing::warn!("⚠️ Failed to initialize vector indexes: {}. Will retry on first use.", e);
+            } else {
+                info!("✅ Neo4j vector indexes initialized (384-dim)");
+            }
+            
             Some(Arc::new(client))
         }
         Err(e) => {
-            tracing::warn!("⚠️ Neo4j connection failed: {}. Graph operations will be limited.", e);
-            None
-        }
-    };
-
-    // Initialize Zilliz client
-    let zilliz_client = match ZillizClient::new(
-        &config.zilliz_endpoint,
-        &config.zilliz_api_key,
-        &config.zilliz_collection,
-    ).await {
-        Ok(client) => {
-            info!("✅ Zilliz connection established");
-            Some(Arc::new(client))
-        }
-        Err(e) => {
-            tracing::warn!("⚠️ Zilliz connection failed: {}. Vector operations will be limited.", e);
+            tracing::warn!("⚠️ Neo4j connection failed: {}. Graph and vector operations will be limited.", e);
             None
         }
     };
@@ -89,7 +79,6 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         config: config.clone(),
         neo4j: neo4j_client,
-        zilliz: zilliz_client,
         db_pool,
     });
 

@@ -1,12 +1,12 @@
 //! Cross-source linker service
 //!
 //! The core innovation: links code chunks to document chunks based on
-//! vector similarity, explicit mentions, temporal proximity, and author overlap.
+//! vector similarity (via Neo4j native indexes), explicit mentions, 
+//! temporal proximity, and author overlap.
 
 use crate::config::Config;
-use crate::error::{GraphError, GraphResult};
+use crate::error::GraphResult;
 use crate::graph_db::Neo4jClient;
-use crate::vector_db::ZillizClient;
 use crate::models::{
     Chunk, RelationshipType, RelationshipEvidence, ExtractionMethod, SemanticLink,
 };
@@ -15,10 +15,11 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 /// Cross-source linker for creating semantic relationships
+/// 
+/// Now uses Neo4j native vector indexes instead of separate Zilliz database.
 pub struct CrossSourceLinker {
     config: Config,
     neo4j: Option<Arc<Neo4jClient>>,
-    zilliz: Option<Arc<ZillizClient>>,
 }
 
 /// Result of a linking operation
@@ -33,18 +34,19 @@ impl CrossSourceLinker {
     pub fn new(
         config: Config,
         neo4j: Option<Arc<Neo4jClient>>,
-        zilliz: Option<Arc<ZillizClient>>,
     ) -> Self {
-        Self { config, neo4j, zilliz }
+        Self { config, neo4j }
     }
     
-    /// Create cross-source links between code and document chunks
+    /// Create cross-source links between code and document chunks using Neo4j
     /// 
     /// This is the main algorithm that makes the system unique:
-    /// 1. Find semantically similar chunks across sources
+    /// 1. Find semantically similar chunks via Neo4j vector index
     /// 2. Boost confidence with explicit mentions
     /// 3. Boost with temporal proximity
     /// 4. Boost with author overlap
+    /// 
+    /// All operations happen in Neo4j, eliminating the need for separate Zilliz queries.
     pub async fn link_chunks(
         &self,
         code_chunks: &[Chunk],
@@ -61,127 +63,155 @@ impl CrossSourceLinker {
             code_chunks.iter().map(|c| (c.id, c)).collect();
         let doc_map: std::collections::HashMap<Uuid, &Chunk> = 
             doc_chunks.iter().map(|c| (c.id, c)).collect();
-        let code_embedding_map: std::collections::HashMap<Uuid, &Vec<f32>> = 
-            code_embeddings.iter().map(|(id, emb)| (*id, emb)).collect();
         
-        // For each document chunk, find similar code chunks
-        for (doc_id, doc_embedding) in doc_embeddings {
-            let doc_chunk = match doc_map.get(doc_id) {
-                Some(c) => *c,
-                None => continue,
-            };
-            
-            // Find similar code chunks via vector similarity
-            let similar_code = self.find_similar_vectors(
-                doc_embedding,
-                code_embeddings,
-                self.config.max_cross_links_per_chunk,
-            );
-            
-            for (code_id, similarity) in similar_code {
-                if similarity < self.config.similarity_threshold {
-                    continue;
-                }
-                
-                let code_chunk = match code_map.get(&code_id) {
+        // For each document chunk, find similar code chunks via Neo4j vector index
+        if let Some(neo4j) = &self.neo4j {
+            for (doc_id, _doc_embedding) in doc_embeddings {
+                let doc_chunk = match doc_map.get(doc_id) {
                     Some(c) => *c,
                     None => continue,
                 };
                 
-                // Calculate confidence with boosts
-                let mut confidence = similarity;
-                let mut extraction_methods = vec![ExtractionMethod::VectorSimilarity];
-                let mut evidence_text = None;
-                let mut author_match = false;
-                let mut temporal_distance = None;
-                
-                // Boost 1: Explicit mentions
-                if self.config.enable_explicit_mentions {
-                    if let Some(mention) = self.detect_explicit_mention(&doc_chunk.content, code_chunk) {
-                        confidence += 0.15;
-                        confidence = confidence.min(1.0);
-                        extraction_methods.push(ExtractionMethod::ExplicitMention);
-                        evidence_text = Some(mention);
-                    }
-                }
-                
-                // Boost 2: Temporal proximity
-                if self.config.enable_temporal_proximity {
-                    // Use updated_at for doc, commit_date for code
-                    if let Some(code_date) = code_chunk.commit_date {
-                        let doc_date = doc_chunk.updated_at;
-                        let days = self.temporal_proximity_score(doc_date, code_date);
-                        if days <= self.config.temporal_proximity_days {
-                            let boost = 0.1 * (1.0 - (days as f32 / self.config.temporal_proximity_days as f32));
-                            confidence += boost;
-                            confidence = confidence.min(1.0);
-                            extraction_methods.push(ExtractionMethod::TemporalProximity);
-                            temporal_distance = Some(days as i32);
+                // Use Neo4j native vector search with confidence boosters
+                match neo4j.find_similar_chunks_for_linking(
+                    &doc_id.to_string(),
+                    "code",
+                    self.config.max_cross_links_per_chunk,
+                    self.config.similarity_threshold,
+                ).await {
+                    Ok(matches) => {
+                        for m in matches {
+                            let code_id = Uuid::parse_str(&m.target_id).unwrap_or_else(|_| Uuid::new_v4());
+                            let code_chunk = match code_map.get(&code_id) {
+                                Some(c) => *c,
+                                None => continue,
+                            };
+                            
+                            // Calculate additional confidence boosters if needed
+                            let mut confidence = m.confidence;
+                            let mut extraction_methods = vec![ExtractionMethod::VectorSimilarity];
+                            let mut evidence_text = None;
+                            let mut author_match = m.has_author_overlap;
+                            let mut temporal_distance = None;
+                            
+                            // Additional explicit mention detection (beyond what Neo4j does)
+                            if self.config.enable_explicit_mentions && !m.has_explicit_mention {
+                                if let Some(mention) = self.detect_explicit_mention(&doc_chunk.content, code_chunk) {
+                                    confidence += self.config.explicit_mention_boost;
+                                    confidence = confidence.min(1.0);
+                                    extraction_methods.push(ExtractionMethod::ExplicitMention);
+                                    evidence_text = Some(mention);
+                                }
+                            } else if m.has_explicit_mention {
+                                extraction_methods.push(ExtractionMethod::ExplicitMention);
+                            }
+                            
+                            // Temporal proximity boost
+                            if self.config.enable_temporal_proximity {
+                                if let Some(code_date) = code_chunk.commit_date {
+                                    let doc_date = doc_chunk.updated_at;
+                                    let days = self.temporal_proximity_score(doc_date, code_date);
+                                    if days <= self.config.temporal_proximity_days {
+                                        let boost = self.config.temporal_proximity_boost 
+                                            * (1.0 - (days as f32 / self.config.temporal_proximity_days as f32));
+                                        confidence += boost;
+                                        confidence = confidence.min(1.0);
+                                        extraction_methods.push(ExtractionMethod::TemporalProximity);
+                                        temporal_distance = Some(days as i32);
+                                    }
+                                }
+                            }
+                            
+                            // Author overlap (may already be detected by Neo4j)
+                            if m.has_author_overlap {
+                                extraction_methods.push(ExtractionMethod::AuthorOverlap);
+                            }
+                            
+                            // Determine relationship type
+                            let rel_type = self.determine_relationship_type(doc_chunk, code_chunk);
+                            
+                            // Create evidence record
+                            let mut evidence = RelationshipEvidence::new(
+                                *doc_id,
+                                code_id,
+                                rel_type.as_str().to_string(),
+                                confidence,
+                                if extraction_methods.len() > 1 {
+                                    ExtractionMethod::Combined
+                                } else {
+                                    ExtractionMethod::VectorSimilarity
+                                },
+                            );
+                            evidence = evidence
+                                .with_similarity_score(m.similarity_score)
+                                .with_author_match(author_match);
+                            
+                            if let Some(days) = temporal_distance {
+                                evidence = evidence.with_temporal_distance(days);
+                            }
+                            if let Some(text) = evidence_text {
+                                evidence = evidence.with_evidence_text(text);
+                            }
+                            
+                            evidence_records.push(evidence);
+                            
+                            // Create relationship in Neo4j
+                            match neo4j.create_cross_source_link(
+                                &doc_id.to_string(),
+                                &m.target_id,
+                                confidence,
+                                m.similarity_score,
+                                m.has_explicit_mention,
+                                m.has_author_overlap,
+                            ).await {
+                                Ok(_) => links_created += 1,
+                                Err(e) => errors.push(format!("Neo4j relationship error: {}", e)),
+                            }
                         }
                     }
+                    Err(e) => errors.push(format!("Vector search error: {}", e)),
                 }
+            }
+        } else {
+            // Fallback: in-memory linking without Neo4j
+            let code_embedding_map: std::collections::HashMap<Uuid, &Vec<f32>> = 
+                code_embeddings.iter().map(|(id, emb)| (*id, emb)).collect();
+            
+            for (doc_id, doc_embedding) in doc_embeddings {
+                let doc_chunk = match doc_map.get(doc_id) {
+                    Some(c) => *c,
+                    None => continue,
+                };
                 
-                // Boost 3: Author overlap
-                if self.config.enable_author_overlap {
-                    if let (Some(doc_author), Some(code_author)) = 
-                        (&doc_chunk.author, &code_chunk.author)
-                    {
-                        if doc_author == code_author {
-                            confidence += 0.1;
-                            confidence = confidence.min(1.0);
-                            extraction_methods.push(ExtractionMethod::AuthorOverlap);
-                            author_match = true;
-                        }
-                    }
-                }
-                
-                // Determine relationship type based on context
-                let rel_type = self.determine_relationship_type(doc_chunk, code_chunk);
-                
-                // Create evidence record
-                let mut evidence = RelationshipEvidence::new(
-                    *doc_id,
-                    code_id,
-                    rel_type.as_str().to_string(),
-                    confidence,
-                    if extraction_methods.len() > 1 {
-                        ExtractionMethod::Combined
-                    } else {
-                        ExtractionMethod::VectorSimilarity
-                    },
+                // Find similar code chunks via in-memory cosine similarity
+                let similar_code = self.find_similar_vectors(
+                    doc_embedding,
+                    code_embeddings,
+                    self.config.max_cross_links_per_chunk,
                 );
-                evidence = evidence
-                    .with_similarity_score(similarity)
-                    .with_author_match(author_match);
                 
-                if let Some(days) = temporal_distance {
-                    evidence = evidence.with_temporal_distance(days);
-                }
-                if let Some(text) = evidence_text {
-                    evidence = evidence.with_evidence_text(text);
-                }
-                
-                evidence_records.push(evidence);
-                
-                // Create relationship in Neo4j if available
-                if let Some(neo4j) = &self.neo4j {
-                    match neo4j.create_relationship(
-                        &doc_id.to_string(),
-                        &code_id.to_string(),
-                        rel_type,
-                        confidence,
-                        Some(serde_json::json!({
-                            "similarity_score": similarity,
-                            "extraction_methods": extraction_methods.iter()
-                                .map(|m| m.as_str())
-                                .collect::<Vec<_>>(),
-                        })),
-                    ).await {
-                        Ok(_) => links_created += 1,
-                        Err(e) => errors.push(format!("Neo4j relationship error: {}", e)),
+                for (code_id, similarity) in similar_code {
+                    if similarity < self.config.similarity_threshold {
+                        continue;
                     }
-                } else {
-                    links_created += 1; // Count even without Neo4j
+                    
+                    let code_chunk = match code_map.get(&code_id) {
+                        Some(c) => *c,
+                        None => continue,
+                    };
+                    
+                    let rel_type = self.determine_relationship_type(doc_chunk, code_chunk);
+                    
+                    let evidence = RelationshipEvidence::new(
+                        *doc_id,
+                        code_id,
+                        rel_type.as_str().to_string(),
+                        similarity,
+                        ExtractionMethod::VectorSimilarity,
+                    ).with_similarity_score(similarity);
+                    
+                    evidence_records.push(evidence);
+                    links_created += 1;
                 }
             }
         }
@@ -193,7 +223,7 @@ impl CrossSourceLinker {
         })
     }
     
-    /// Find similar vectors using cosine similarity
+    /// Find similar vectors using cosine similarity (fallback for when Neo4j unavailable)
     fn find_similar_vectors(
         &self,
         query: &[f32],
@@ -212,7 +242,6 @@ impl CrossSourceLinker {
     
     /// Detect if document explicitly mentions code entities
     fn detect_explicit_mention(&self, doc_content: &str, code_chunk: &Chunk) -> Option<String> {
-        // Look for function names, class names, file names
         let doc_lower = doc_content.to_lowercase();
         
         // Check file name
@@ -253,12 +282,11 @@ impl CrossSourceLinker {
     
     /// Calculate temporal proximity in days
     fn temporal_proximity_score(&self, doc_date: DateTime<Utc>, commit_date: DateTime<Utc>) -> i64 {
-        let diff = (doc_date - commit_date).num_days().abs();
-        diff
+        (doc_date - commit_date).num_days().abs()
     }
     
     /// Determine the type of cross-source relationship
-    fn determine_relationship_type(&self, doc_chunk: &Chunk, code_chunk: &Chunk) -> RelationshipType {
+    fn determine_relationship_type(&self, doc_chunk: &Chunk, _code_chunk: &Chunk) -> RelationshipType {
         let doc_content = doc_chunk.content.to_lowercase();
         
         // Check for documentation-style content
@@ -300,7 +328,7 @@ impl CrossSourceLinker {
                     to_chunk_id: Uuid::parse_str(&target_id).unwrap_or_else(|_| Uuid::new_v4()),
                     relationship_type: rel_type,
                     confidence,
-                    extraction_methods: vec!["vector_similarity".to_string()],
+                    extraction_methods: vec!["neo4j_vector_similarity".to_string()],
                     similarity_score: None,
                     explicit_mention: None,
                     temporal_distance_days: None,
