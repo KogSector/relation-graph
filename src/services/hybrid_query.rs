@@ -111,6 +111,7 @@ impl HybridQueryEngine {
         });
         
         let execution_time = start_time.elapsed().as_millis() as u64;
+        let cross_source_links_count = cross_source_links.len();
         
         Ok(HybridSearchResponse {
             chunks: vector_results.clone(),
@@ -122,7 +123,7 @@ impl HybridQueryEngine {
                 vector_results_count: vector_results.len(),
                 graph_entities_count: 0, // Will be updated
                 graph_hops_performed: options.graph_hops,
-                cross_source_links_count: cross_source_links.len(),
+                cross_source_links_count,
                 execution_time_ms: execution_time,
             },
         })

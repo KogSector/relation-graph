@@ -71,7 +71,7 @@ pub struct HybridSearchRequest {
 }
 
 /// A single search result with chunk and score
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ChunkResult {
     pub chunk_id: Uuid,
     pub content: String,
